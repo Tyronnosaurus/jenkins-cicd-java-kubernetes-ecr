@@ -1,0 +1,83 @@
+#!/usr/bin/env groovy
+
+pipeline {
+    agent any
+    tools {
+        maven 'maven-3.9'  // Must be the one configured in Jenkins tools 
+    }
+    environment {
+        DOCKER_REPO_SERVER = '488378077264.dkr.ecr.eu-central-1.amazonaws.com'  // Replace with your own ECR repo URL
+        DOCKER_REPO = "${DOCKER_REPO_SERVER}/nana-project"
+    }
+    stages {
+        // Use a version parser to genereate the next version (1.0.0 -> 1.0.1) from the version specified in the pom.xml file.
+        stage('increment version') {
+            steps {
+                script {
+                    echo 'incrementing app version...'
+                    sh 'mvn build-helper:parse-version versions:set \
+                        -DnewVersion=\\\${parsedVersion.majorVersion}.\\\${parsedVersion.minorVersion}.\\\${parsedVersion.nextIncrementalVersion} \
+                        versions:commit'
+                    // Save version to use it later for the image's name  
+                    def matcher = readFile('pom.xml') =~ '<version>(.+)</version>'
+                    def version = matcher[0][1]
+                    env.IMAGE_NAME = "$version-$BUILD_NUMBER"
+                }
+            }
+        }
+        // Builds the Java app into a jar file.
+        // We also "clean" so that any previous jars are deleted. This way the Dockerfile can just look for "java-maven-app-*.jar" without the need to specify the actual filename. 
+        stage('build app') {
+            steps {
+                script {
+                    echo 'building the application...'
+                    sh 'mvn clean package'
+                }
+            }
+        }
+        // Using the built jar, create an image based on the Dockerfile
+        stage('build image') {
+            steps {
+                script {
+                    echo "building the docker image..."
+                    withCredentials([usernamePassword(credentialsId: 'ecr-credentials', passwordVariable: 'PASS', usernameVariable: 'USER')]){
+                        sh "docker build -t ${DOCKER_REPO}:${IMAGE_NAME} ."
+                        sh 'echo $PASS | docker login -u $USER --password-stdin ${DOCKER_REPO_SERVER}'
+                        sh "docker push ${DOCKER_REPO}:${IMAGE_NAME}"
+                    }
+                }
+            }
+        }
+        // Deploy on a previously created Kubernetes cluster.
+        // kubectl must be installed on the same server Jenkins is running, with the correct '.kube/config' file
+        stage('deploy') {
+            environment {
+                AWS_ACCESS_KEY_ID = credentials('jenkins_aws_access_key_id')
+                AWS_SECRET_ACCESS_KEY = credentials('jenkins_aws_secret_access_key')
+                APP_NAME = 'java-maven-app'
+            }
+            steps {
+                script {
+                    echo 'deploying docker image...'
+                    //sh 'kubectl get namespaces --v=4'  // Test that kubectl connects correctly (with verbose level 'debugging')
+                    sh 'envsubst < kubernetes/deployment.yaml | kubectl apply -f -'
+                    sh 'envsubst < kubernetes/service.yaml | kubectl apply -f -'
+                }
+            }
+        }
+        // In the 'increment version' stage we updated the pom.xml to increase the app version. 
+        // We now need to commit that change to the repo so that we see it next time we build (otherwise the version would always be the same).
+        stage('commit version update'){
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'gitlab-credentials', passwordVariable: 'PASS', usernameVariable: 'USER')]){
+                        sh "git remote set-url origin https://${USER}:${PASS}@gitlab.com/etiron/java-maven-app.git"  // Replace with your Origin
+                        sh 'git add .'
+                        sh 'git commit -m "ci: version bump"'
+                        sh 'git push origin HEAD:jenkins-jobs'
+                    }
+                }
+            }
+        }
+    }
+}
